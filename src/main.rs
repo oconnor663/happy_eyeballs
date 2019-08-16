@@ -2,10 +2,10 @@
 
 use futures::channel::mpsc;
 use futures::channel::oneshot;
-use futures::select;
 use futures::pin_mut;
 use futures::prelude::*;
-use futures::stream::{FuturesUnordered, Fuse};
+use futures::select;
+use futures::stream::{Fuse, FuturesUnordered};
 use rand::prelude::*;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -111,7 +111,8 @@ async fn happy_eyeballs() -> Result<(), ()> {
                 .timeout(Duration::from_millis(WAIT_MILLIS))
                 .await;
         }
-    }.fuse();
+    }
+        .fuse();
     pin_mut!(attempt_starter);
 
     let attempt_waiter = async {
@@ -130,7 +131,8 @@ async fn happy_eyeballs() -> Result<(), ()> {
                 }
             }
         }
-    }.fuse();
+    }
+        .fuse();
     pin_mut!(attempt_waiter);
 
     select! {
