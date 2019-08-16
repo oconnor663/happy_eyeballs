@@ -1,14 +1,70 @@
 #![feature(async_await)]
 
+use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::future::{self, Either};
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use rand::prelude::*;
 use std::time::{Duration, Instant};
+use std::pin::Pin;
+use std::task::{Poll, Context};
 
 const NEXT_ATTEMPT_WAIT_MILLIS: u64 = 250;
 const MAX_ATTEMPTS: u64 = 3;
+
+struct Nursery<T: Future> {
+    receiver: mpsc::Receiver<T>,
+    futures: FuturesUnordered<T>,
+}
+
+impl<T: Future> Nursery<T> {
+    fn new() -> (Self, mpsc::Sender<T>) {
+        let (sender, receiver) = mpsc::channel(0);
+        (
+            Self {
+                receiver,
+                futures: FuturesUnordered::new(),
+            },
+            sender,
+        )
+    }
+}
+
+impl<T: Future> Stream for Nursery<T> {
+    type Item = T::Output;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        // Take as many futures as we can from the receiver and seat them in
+        // the FuturesUnordered collection. Note that if we didn't loop until
+        // Poll::Pending here, we wouldn't be guaranteed to get another wakeup
+        // in the future.
+        let mut channel_open = true;
+        loop {
+            match Pin::new(&mut self.receiver).poll_next(cx) {
+                Poll::Ready(Some(future)) => self.futures.push(future),
+                Poll::Ready(None) => {
+                    channel_open = false;
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+        // If any futures are ready, return one item to the caller. Otherwise
+        // this poll_next() call might return Pending if there are unfinished
+        // futures, or Ready(None) if we don't have any futures right now.
+        if let Poll::Ready(Some(item)) = Pin::new(&mut self.futures).poll_next(cx) {
+            return Poll::Ready(Some(item));
+        }
+        // If we didn't get an item above, but the channel is still open,
+        // return Pending to the caller. Otherwise we're done.
+        if channel_open {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
 
 // Simulate a "DNS lookup" (really any kind of network IO, who cares what) by
 // just waiting for some random number of milliseconds, flipping a coin, and
@@ -26,7 +82,12 @@ async fn dummy_dns_lookup() -> Result<(), ()> {
 }
 
 fn log(id: u64, verb: &str, t0: Instant) {
-    eprintln!("{} {} at {} ms", id, verb, (Instant::now() - t0).as_millis());
+    eprintln!(
+        "{} {} at {} ms",
+        id,
+        verb,
+        (Instant::now() - t0).as_millis()
+    );
 }
 
 #[tokio::main]
