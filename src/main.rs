@@ -2,9 +2,7 @@
 
 use futures::channel::mpsc;
 use futures::channel::oneshot;
-use futures::pin_mut;
 use futures::prelude::*;
-use futures::select;
 use futures::stream::{Fuse, FuturesUnordered};
 use rand::prelude::*;
 use std::pin::Pin;
@@ -16,13 +14,13 @@ const WAIT_MILLIS: u64 = 250;
 const MAX_ATTEMPTS: u64 = 3;
 
 struct Nursery<T: Future> {
-    receiver: Fuse<mpsc::Receiver<T>>,
+    receiver: Fuse<mpsc::UnboundedReceiver<T>>,
     futures: FuturesUnordered<T>,
 }
 
 impl<T: Future> Nursery<T> {
-    fn new() -> (Self, mpsc::Sender<T>) {
-        let (sender, receiver) = mpsc::channel(0);
+    fn new() -> (Self, mpsc::UnboundedSender<T>) {
+        let (sender, receiver) = mpsc::unbounded();
         (
             Self {
                 receiver: receiver.fuse(),
@@ -81,63 +79,64 @@ fn log(id: u64, verb: &str, t0: Instant) {
     eprintln!("{} {} at {} ms", id, verb, millis);
 }
 
+async fn attempt(
+    id: u64,
+    prev_fail_receiver: Option<oneshot::Receiver<()>>,
+    mut attempt_sender: mpsc::UnboundedSender<Pin<Box<dyn Future<Output = Result<u64, u64>>>>>,
+    t0: Instant,
+) -> Result<u64, u64> {
+    if let Some(prev_fail) = prev_fail_receiver {
+        // Timeout isn't an error here, so ignore the result.
+        let _ = prev_fail.timeout(Duration::from_millis(WAIT_MILLIS)).await;
+    }
+    log(id, "started", t0);
+    let (fail_sender, fail_receiver) = oneshot::channel();
+    if id + 1 < MAX_ATTEMPTS {
+        attempt_sender
+            .send(Box::pin(attempt(
+                id + 1,
+                Some(fail_receiver),
+                attempt_sender.clone(),
+                t0,
+            )))
+            .await
+            .unwrap();
+    } else {
+        eprintln!("Reached the maximum number of attempts.");
+    }
+    match dummy_dns_lookup().await {
+        Ok(()) => Ok(id),
+        Err(()) => {
+            // Ignore failure in this send, because the receiving attempt might
+            // have failed already too.
+            let _ = fail_sender.send(());
+            Err(id)
+        }
+    }
+}
+
 async fn happy_eyeballs() -> Result<(), ()> {
     let t0 = Instant::now();
     let (mut nursery, mut attempt_sender) = Nursery::new();
-
-    let attempt_starter = async {
-        let mut id = 0;
-        loop {
-            log(id, "started", t0);
-            let (fail_sender, fail_receiver) = oneshot::channel::<()>();
-            let _ = attempt_sender
-                .send(async move {
-                    match dummy_dns_lookup().await {
-                        Ok(()) => Ok(id),
-                        Err(()) => {
-                            let _ = fail_sender.send(());
-                            Err(id)
-                        }
-                    }
-                })
-                .await;
-            id += 1;
-            if id == MAX_ATTEMPTS {
-                eprintln!("Max attempts reached.");
-                drop(attempt_sender);
-                break;
+    attempt_sender
+        .send(Box::pin(attempt(0, None, attempt_sender.clone(), t0)))
+        .await
+        .unwrap();
+    drop(attempt_sender);
+    loop {
+        match nursery.next().await {
+            Some(Ok(id)) => {
+                log(id, "succeeded", t0);
+                return Ok(());
             }
-            let _ = fail_receiver
-                .timeout(Duration::from_millis(WAIT_MILLIS))
-                .await;
-        }
-    }
-        .fuse();
-    pin_mut!(attempt_starter);
-
-    let attempt_waiter = async {
-        loop {
-            match nursery.next().await {
-                Some(Ok(id)) => {
-                    log(id, "succeeded", t0);
-                    return Ok(());
-                }
-                Some(Err(id)) => {
-                    log(id, "failed", t0);
-                }
-                None => {
-                    eprintln!("All attempts failed.");
-                    return Err(());
-                }
+            Some(Err(id)) => {
+                log(id, "failed", t0);
+            }
+            None => {
+                eprintln!("All attempts failed.");
+                return Err(());
             }
         }
-    }
-        .fuse();
-    pin_mut!(attempt_waiter);
-
-    select! {
-        _ = attempt_starter => attempt_waiter.await,
-        result = attempt_waiter => result,
     }
 }
 
