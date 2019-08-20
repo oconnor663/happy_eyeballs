@@ -40,13 +40,13 @@ impl<T: Future> Stream for Nursery<T> {
         // Poll::Pending here, we wouldn't be guaranteed to get another wakeup
         // in the future.
         loop {
-            match Pin::new(&mut self.receiver).poll_next(cx) {
+            match self.receiver.poll_next_unpin(cx) {
                 Poll::Ready(Some(future)) => self.futures.push(future),
                 Poll::Ready(None) | Poll::Pending => break,
             }
         }
         // If any futures are ready, return one item to the caller.
-        if let Poll::Ready(Some(item)) = Pin::new(&mut self.futures).poll_next(cx) {
+        if let Poll::Ready(Some(item)) = self.futures.poll_next_unpin(cx) {
             return Poll::Ready(Some(item));
         }
         // If there are no futures in the collection, and the channel is
